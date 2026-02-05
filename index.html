@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>3D Parcel Master Pro - Cuboid Logic</title>
+    <script async src="https://docs.opencv.org/4.5.4/opencv.js" type="text/javascript"></script>
+    <style>
+        body { margin: 0; background: #000; font-family: sans-serif; overflow: hidden; color: white; touch-action: none; }
+        #container { position: relative; width: 100vw; height: 100vh; }
+        video { position: absolute; width: 100%; height: 100%; object-fit: cover; opacity: 0; }
+        canvas { position: absolute; width: 100%; height: 100%; object-fit: cover; z-index: 5; }
+        #ui-top { position: absolute; top: 0; width: 100%; z-index: 20; background: rgba(0,0,0,0.8); padding: 20px 0; text-align: center; border-bottom: 2px solid #007bff; }
+        .status { font-size: 1.1rem; font-weight: bold; }
+        .controls { position: absolute; bottom: 30px; width: 100%; z-index: 20; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+        button { padding: 18px 30px; font-size: 1.1rem; border-radius: 50px; border: none; font-weight: bold; color: white; cursor: pointer; width: 80%; }
+        #btn-reset { background: #444; width: 50%; }
+        #loading { position: fixed; inset: 0; background: #111; z-index: 100; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+        .hint { position: absolute; top: 55%; width: 100%; text-align: center; color: #007bff; font-weight: bold; z-index: 10; pointer-events: none; text-shadow: 0 0 10px black; }
+    </style>
+</head>
+<body>
+
+<div id="loading">
+    <div style="font-size: 3rem; margin-bottom: 15px;">📦</div>
+    <p>3D-KI wird geladen...</p>
+</div>
+
+<div id="container">
+    <video id="videoInput" playsinline muted></video>
+    <canvas id="canvasOutput" onclick="handleCanvasClick(event)"></canvas>
+    <div id="tap-hint" class="hint">➔ PAKET-MITTE ANKLICKEN</div>
+</div>
+
+<div id="ui-top">
+    <div id="status" class="status">Warte auf Kamera...</div>
+</div>
+
+<div class="controls">
+    <button id="btn-reset" onclick="resetApp()">NEU KALIBRIEREN</button>
+</div>
+
+<script>
+let state = 'SCAN'; 
+let pxPerCm = localStorage.getItem('px_cm_v3') ? parseFloat(localStorage.getItem('px_cm_v3')) : null;
+let calibSamples = [];
+const REQUIRED_SAMPLES = 40;
+
+const video = document.getElementById('videoInput');
+const canvas = document.getElementById('canvasOutput');
+const ctx = canvas.getContext('2d');
+const statusText = document.getElementById('status');
+
+let isStreaming = false;
+let lastResult = null;
+
+function onOpenCvReady() {
+    document.getElementById('loading').style.display = 'none';
+    initCamera();
+}
+
+async function initCamera() {
+    const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { facingMode: "environment", width: 1280, height: 720 } 
+    });
+    video.srcObject = stream;
+    video.play();
+    video.oncanplay = () => {
+        if (!isStreaming) {
+            isStreaming = true;
+            state = pxPerCm ? 'READY' : 'SCAN';
+            updateUI();
+            processFrame();
+        }
+    };
+}
+
+function updateUI() {
+    if (state === 'SCAN') {
+        statusText.innerText = "Phase 1: Blatt scannen";
+        statusText.style.color = "#ffc107";
+        document.getElementById('tap-hint').style.display = "none";
+    } else if (state === 'READY') {
+        statusText.innerText = "Phase 2: Paket-Mitte antippen";
+        statusText.style.color = "#00ff00";
+        document.getElementById('tap-hint').style.display = "block";
+    } else {
+        statusText.innerText = "Ergebnis (Tippen für neu)";
+        document.getElementById('tap-hint').style.display = "none";
+    }
+}
+
+function resetApp() {
+    localStorage.removeItem('px_cm_v3');
+    pxPerCm = null; calibSamples = []; state = 'SCAN'; lastResult = null;
+    updateUI();
+}
+
+function handleCanvasClick(event) {
+    if (state === 'READY') {
+        const rect = canvas.getBoundingClientRect();
+        const x = (event.clientX - rect.left) * (canvas.width / rect.width);
+        const y = (event.clientY - rect.top) * (canvas.height / rect.height);
+        analyzeCuboid(x, y);
+    } else if (state === 'RESULT') {
+        state = 'READY'; lastResult = null; updateUI();
+    }
+}
+
+function processFrame() {
+    if (!isStreaming || video.videoWidth === 0) { requestAnimationFrame(processFrame); return; }
+    if (state === 'RESULT' && lastResult) { ctx.putImageData(lastResult, 0, 0); requestAnimationFrame(processFrame); return; }
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0);
+
+    if (state === 'SCAN') {
+        let src = cv.imread(canvas);
+        detectA4(src);
+        cv.imshow('canvasOutput', src);
+        src.delete();
+    }
+    requestAnimationFrame(processFrame);
+}
+
+function detectA4(src) {
+    let gray = new cv.Mat();
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.Canny(gray, gray, 50, 150);
+    let contours = new cv.MatVector();
+    let hierarchy = new cv.Mat();
+    cv.findContours(gray, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+    for (let i = 0; i < contours.size(); ++i) {
+        let cnt = contours.get(i);
+        if (cv.contourArea(cnt) > 10000) {
+            let approx = new cv.Mat();
+            cv.approxPolyDP(cnt, approx, 0.02 * cv.arcLength(cnt, true), true);
+            if (approx.rows === 4) {
+                let pts = [];
+                for(let j=0; j<4; j++) pts.push({x: approx.data32S[j*2], y: approx.data32S[j*2+1]});
+                let d1 = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+                let d2 = Math.hypot(pts[1].x - pts[2].x, pts[1].y - pts[2].y);
+                calibSamples.push(Math.max(d1, d2) / 29.7);
+                if (calibSamples.length >= REQUIRED_SAMPLES) {
+                    pxPerCm = calibSamples.sort((a,b) => a-b)[20];
+                    localStorage.setItem('px_cm_v3', pxPerCm);
+                    state = 'READY'; updateUI();
+                }
+            }
+            approx.delete();
+        }
+    }
+    gray.delete(); contours.delete(); hierarchy.delete();
+}
+
+function analyzeCuboid(clickX, clickY) {
+    statusText.innerText = "Paket-Geometrie wird analysiert...";
+    let src = cv.imread(canvas);
+    
+    // GrabCut ROI um Klickpunkt (begrenzt auf Paket-Bereich)
+    let mask = new cv.Mat.zeros(src.rows, src.cols, cv.CV_8UC1);
+    let bgdModel = new cv.Mat();
+    let fgdModel = new cv.Mat();
+    let rect = new cv.Rect(clickX - 100, clickY - 100, 200, 200); // Fokusbox
+    
+    try {
+        cv.grabCut(src, mask, rect, bgdModel, fgdModel, 3, cv.GC_INIT_WITH_RECT);
+        
+        for (let i = 0; i < mask.rows; i++) {
+            for (let j = 0; j < mask.cols; j++) {
+                let val = mask.ucharPtr(i, j)[0];
+                mask.ucharPtr(i, j)[0] = (val === 1 || val === 3) ? 255 : 0;
+            }
+        }
+
+        let contours = new cv.MatVector();
+        let hierarchy = new cv.Mat();
+        cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+        if (contours.size() > 0) {
+            let paket = contours.get(0);
+            let maxArea = 0;
+            for(let i=0; i<contours.size(); i++) {
+                if(cv.contourArea(contours.get(i)) > maxArea) {
+                    maxArea = cv.contourArea(contours.get(i));
+                    paket = contours.get(i);
+                }
+            }
+            
+            // Hexagon-Silhouette Logik
+            let hull = new cv.Mat();
+            cv.convexHull(paket, hull);
+            let approx = new cv.Mat();
+            // Wir erzwingen eine Vereinfachung auf ca. 6-8 Ecken
+            cv.approxPolyDP(hull, approx, 0.025 * cv.arcLength(hull, true), true);
+            
+            extract3DDimensions(approx);
+            
+            hull.delete(); approx.delete();
+        }
+        
+        state = 'RESULT';
+        updateUI();
+        lastResult = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        
+        mask.delete(); bgdModel.delete(); fgdModel.delete(); contours.delete(); hierarchy.delete();
+    } catch(e) { 
+        alert("Fehler bei der Erkennung. Bitte Paket deutlicher antippen.");
+        state = 'READY';
+    }
+    src.delete();
+}
+
+function extract3DDimensions(approx) {
+    let pts = [];
+    for (let i = 0; i < approx.rows; i++) {
+        pts.push({ x: approx.data32S[i*2], y: approx.data32S[i*2+1] });
+    }
+
+    let edges = [];
+    pts.forEach((p1, i) => {
+        let p2 = pts[(i + 1) % pts.length];
+        let dx = p2.x - p1.x;
+        let dy = p2.y - p1.y;
+        let angle = Math.abs(Math.atan2(dy, dx) * 180 / Math.PI);
+        if (angle > 90) angle = 180 - angle;
+        let dist = Math.hypot(dx, dy) / pxPerCm;
+        edges.push({p1, p2, dist, angle});
+    });
+
+    // --- QUADER LOGIK ---
+    // 1. Gruppe: Senkrecht (Höhe) -> Winkel nahe 90°
+    let hGroup = edges.filter(e => e.angle > 65);
+    // 2. Gruppe: Bodenkanten -> Winkel flach
+    let floorEdges = edges.filter(e => e.angle <= 65);
+
+    // Wir suchen zwei Paare für L und B
+    floorEdges.sort((a,b) => a.angle - b.angle);
+    let groupL = [], groupB = [];
+    if (floorEdges.length > 0) {
+        let baseAngle = floorEdges[0].angle;
+        floorEdges.forEach(e => {
+            if (Math.abs(e.angle - baseAngle) < 25) groupL.push(e);
+            else groupB.push(e);
+        });
+    }
+
+    // Zeichnen mit Korrektur (Gegenüberliegende Seiten)
+    if (hGroup.length > 0) {
+        let bestH = hGroup.sort((a,b) => b.dist - a.dist)[0];
+        drawFinalLine(bestH, "HOEHE", "#ffff00");
+    }
+    
+    if (groupL.length > 0 && groupB.length > 0) {
+        let L = groupL.sort((a,b) => b.dist - a.dist)[0];
+        let B = groupB.sort((a,b) => b.dist - a.dist)[0];
+        
+        // Logische Korrektur: Die längere ist L
+        if (B.dist > L.dist) { let t = L; L = B; B = t; }
+        
+        drawFinalLine(L, "LAENGE", "#00ff00");
+        drawFinalLine(B, "BREITE", "#007bff");
+    } else if (floorEdges.length >= 2) {
+        // Fallback falls Gruppierung scheitert
+        floorEdges.sort((a,b) => b.dist - a.dist);
+        drawFinalLine(floorEdges[0], "LAENGE", "#00ff00");
+        drawFinalLine(floorEdges[1], "BREITE", "#007bff");
+    }
+}
+
+function drawFinalLine(e, label, col) {
+    ctx.strokeStyle = col; ctx.lineWidth = 14; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(e.p1.x, e.p1.y); ctx.lineTo(e.p2.x, e.p2.y); ctx.stroke();
+    
+    let mx = (e.p1.x + e.p2.x)/2, my = (e.p1.y + e.p2.y)/2;
+    ctx.fillStyle = "rgba(0,0,0,0.85)";
+    ctx.font = "bold 28px Arial";
+    let txt = `${label.charAt(0)}: ${e.dist.toFixed(1)} cm`;
+    let tw = ctx.measureText(txt).width;
+    ctx.fillRect(mx - tw/2 - 10, my - 25, tw + 20, 45);
+    ctx.fillStyle = col;
+    ctx.fillText(txt, mx - tw/2, my + 8);
+}
+
+window.onload = () => { if (cv.Mat) onOpenCvReady(); else cv['onRuntimeInitialized'] = onOpenCvReady; };
+</script>
+</body>
+</html>
