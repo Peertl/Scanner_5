@@ -3,26 +3,63 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>AR Parcel Measure</title>
+<title>AR Measure Pro</title>
 <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady();"></script>
 <style>
-    body { margin: 0; background: #000; color: #fff; font-family: sans-serif; overflow: hidden; }
-    /* Video und Canvas müssen deckungsgleich sein. 'cover' beschneidet, 'contain' lässt Ränder.
-       Wir nutzen 'cover' für Fullscreen-Feeling, müssen aber Koordinaten umrechnen. */
+    body { margin: 0; background: #111; color: #fff; font-family: sans-serif; overflow: hidden; }
+    
     video, canvas { 
         position: absolute; top: 0; left: 0; 
         width: 100vw; height: 100vh; 
         object-fit: cover; 
     }
+
     #ui {
-        position: absolute; top: 10px; left: 10px; z-index: 10;
-        background: rgba(0, 0, 0, .7); padding: 15px;
-        border-radius: 8px; pointer-events: none; user-select: none;
-        max-width: 300px;
+        position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+        width: 90%; max-width: 400px; z-index: 10;
+        background: rgba(0, 0, 0, .85); padding: 15px;
+        border-radius: 12px; backdrop-filter: blur(5px);
+        box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        text-align: center;
+        transition: opacity 0.3s;
     }
-    h2 { margin: 0 0 5px 0; font-size: 1.2rem; color: #0f0; }
-    p { margin: 0; font-size: 0.9rem; color: #ccc; }
-    #marker-info { margin-top: 10px; font-size: 0.8rem; border-top: 1px solid #555; padding-top: 5px;}
+
+    h2 { margin: 0 0 5px 0; font-size: 1.1rem; color: #00ff88; }
+    p { margin: 0; font-size: 0.85rem; color: #ddd; line-height: 1.4; }
+
+    /* Fortschrittsbalken Container */
+    .progress-track {
+        width: 100%; height: 8px; background: #333;
+        margin-top: 10px; border-radius: 4px; overflow: hidden;
+    }
+    /* Der eigentliche Balken */
+    .progress-fill {
+        height: 100%; background: #00ff88; width: 0%;
+        transition: width 0.3s ease-out;
+    }
+
+    /* Lade-Overlay (Spinner) */
+    #loading-overlay {
+        position: absolute; top: 0; left: 0; width: 100vw; height: 100vh;
+        background: rgba(0,0,0,0.8); z-index: 20;
+        display: none; flex-direction: column;
+        align-items: center; justify-content: center;
+    }
+    .spinner {
+        width: 50px; height: 50px;
+        border: 5px solid rgba(255,255,255,0.3);
+        border-radius: 50%; border-top-color: #00ff88;
+        animation: spin 1s ease-in-out infinite;
+        margin-bottom: 15px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    
+    #result-toast {
+        position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+        background: rgba(0,255,136, 0.9); color: #000;
+        padding: 10px 20px; border-radius: 20px; font-weight: bold;
+        z-index: 10; opacity: 0; transition: opacity 0.3s; pointer-events: none;
+    }
 </style>
 </head>
 <body>
@@ -30,39 +67,48 @@
 <video id="video" playsinline muted autoplay></video>
 <canvas id="canvas"></canvas>
 
+<!-- UI Panel oben -->
 <div id="ui">
-    <h2 id="status">Lade OpenCV...</h2>
-    <p id="instruction">Bitte warten.</p>
-    <div id="marker-info"></div>
+    <h2 id="status">Systemstart...</h2>
+    <p id="instruction">OpenCV wird geladen</p>
+    <div class="progress-track" id="progress-track" style="display:none">
+        <div class="progress-fill" id="progress-fill"></div>
+    </div>
 </div>
+
+<!-- Lade Screen -->
+<div id="loading-overlay">
+    <div class="spinner"></div>
+    <div style="color:#fff; font-weight:bold;">Berechne Kalibrierung...</div>
+    <div style="color:#aaa; font-size:0.8rem;">Bitte kurz warten (kann hängen)</div>
+</div>
+
+<!-- Ergebnis Toast unten -->
+<div id="result-toast">Pos: 0, 0</div>
 
 <script>
 // --- Konfiguration ---
-const A4_W = 21.0; // cm (Breite)
-const A4_H = 29.7; // cm (Höhe)
-// Wir definieren: Querformat (Landscape) A4 auf dem Boden.
-// 0,0 ist Oben-Links. X geht nach rechts, Y nach unten (auf dem Papier).
+const A4_W = 21.0; 
+const A4_H = 29.7; 
+const FRAMES_NEEDED = 10; // Reduziert von 15 auf 10 für mehr Speed
 
-// --- Globale Variablen ---
 let video, canvas, ctx;
-let streamWidth, streamHeight; // Echte Auflösung des Videostreams
+let streamWidth, streamHeight;
 
 // Kalibrierung
 let objPointsCalib, imgPointsCalib;
 let cameraMatrix, distCoeffs;
 let isCalibrated = false;
 let framesCaptured = 0;
-const FRAMES_NEEDED = 15;
 
-// Tracking / PnP
-let rvec, tvec; // Rotations- und Translationsvektor der aktuellen Pose
-
-// OpenCV Status
+// Tracking
+let rvec, tvec;
 let cvReady = false;
 
 function onOpenCvReady() {
     cvReady = true;
-    document.getElementById("status").innerText = "Kamera starten...";
+    document.getElementById("status").innerText = "Kamerazugriff";
+    document.getElementById("instruction").innerText = "Bitte Zugriff erlauben";
     startCamera();
 }
 
@@ -71,10 +117,10 @@ function startCamera() {
     canvas = document.getElementById("canvas");
     ctx = canvas.getContext("2d");
 
-    // HD-Auflösung anfordern (besser für Erkennung)
+    // HD reicht völlig, 4K macht es langsam
     const constraints = {
         audio: false,
-        video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } }
+        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } }
     };
 
     navigator.mediaDevices.getUserMedia(constraints).then(stream => {
@@ -82,8 +128,6 @@ function startCamera() {
         video.onloadedmetadata = () => {
             streamWidth = video.videoWidth;
             streamHeight = video.videoHeight;
-            
-            // Canvas interne Auflösung auf Video-Auflösung setzen
             canvas.width = streamWidth;
             canvas.height = streamHeight;
             
@@ -91,26 +135,27 @@ function startCamera() {
             requestAnimationFrame(loop);
         };
     }).catch(err => {
-        alert("Kamerafehler: " + err.message);
+        alert("Fehler: " + err.message);
     });
 }
 
 function initOpenCV() {
-    // Matrizen für Kalibrierung initialisieren
     objPointsCalib = new cv.MatVector();
     imgPointsCalib = new cv.MatVector();
     
     document.getElementById("status").innerText = "Kalibrierung";
-    document.getElementById("instruction").innerText = "Zeige ein A4 Blatt komplett.\nBewege es langsam (Winkel ändern).\nFrames: 0/" + FRAMES_NEEDED;
+    document.getElementById("instruction").innerText = "Zeige ein A4 Blatt komplett.\nBewege es langsam (Winkel ändern).";
+    document.getElementById("progress-track").style.display = "block";
 }
 
 function loop() {
     if (!cvReady || !streamWidth) return;
 
-    // Bild vom Video auf Canvas zeichnen
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    
     let src = cv.imread(canvas);
+    
+    // Performance: Bild für Erkennung verkleinern (Scale Down 50% wenn sehr groß)
+    // Wir lassen es hier erst mal 1:1, da wir 720p angefordert haben, das schafft JS meist gut.
     
     try {
         if (!isCalibrated) {
@@ -121,13 +166,15 @@ function loop() {
     } catch (e) {
         console.error(e);
     } finally {
-        src.delete(); // Wichtig: Speicher freigeben!
+        src.delete(); 
     }
 
-    requestAnimationFrame(loop);
+    // Wenn nicht gerade schwer gerechnet wird, weiter loopen
+    if(!isCalculating) requestAnimationFrame(loop);
 }
 
-// --- Bildverarbeitung & Logik ---
+// Flag um Loop zu pausieren während Berechnung
+let isCalculating = false;
 
 function findMarkerAndCalibrate(src) {
     let result = detectQuad(src);
@@ -136,60 +183,85 @@ function findMarkerAndCalibrate(src) {
         let approx = result.approx;
         let corners = sortCorners(approx);
         
-        drawQuad(corners, "orange");
+        drawQuad(corners, "orange"); // Orange = Kalibrierungsmodus
 
-        // Nur jeden 30. Frame speichern, damit wir verschiedene Winkel bekommen
-        // Und nur wenn das Blatt groß genug ist (Nähe)
-        if (framesCaptured < FRAMES_NEEDED && Math.random() > 0.9) {
+        // Bedingungen: Blatt groß genug, Random Sample um Frames zu verteilen
+        if (framesCaptured < FRAMES_NEEDED && Math.random() > 0.8) {
             
-            // 3D Punkte (Modell): Flaches A4 Blatt Z=0
             let obj = cv.matFromArray(4, 1, cv.CV_32FC3, [
-                0, 0, 0,       // TL
-                A4_W, 0, 0,    // TR
-                A4_W, A4_H, 0, // BR
-                0, A4_H, 0     // BL
+                0, 0, 0,       
+                A4_W, 0, 0,    
+                A4_W, A4_H, 0, 
+                0, A4_H, 0     
             ]);
             
-            // 2D Punkte (Bild)
             let img = cv.matFromArray(4, 1, cv.CV_32FC2, corners);
 
             objPointsCalib.push_back(obj);
             imgPointsCalib.push_back(img);
             
             framesCaptured++;
-            document.getElementById("instruction").innerText = `Frames: ${framesCaptured}/${FRAMES_NEEDED}\nKippe das Blatt etwas!`;
             
+            // UI Update
+            let percent = (framesCaptured / FRAMES_NEEDED) * 100;
+            document.getElementById("progress-fill").style.width = percent + "%";
+            document.getElementById("instruction").innerText = `Sammle Daten: ${framesCaptured}/${FRAMES_NEEDED}`;
+
             obj.delete(); img.delete();
         }
-        
-        approx.delete(); // Aufräumen nicht vergessen (Result von detectQuad)
+        approx.delete();
     }
 
-    if (framesCaptured >= FRAMES_NEEDED) {
-        runCalibration();
+    // Wenn fertig, Kalibrierung starten
+    if (framesCaptured >= FRAMES_NEEDED && !isCalculating) {
+        isCalculating = true; // Loop stoppen
+        startCalibrationAsync();
     }
 }
 
+function startCalibrationAsync() {
+    // 1. UI Overlay anzeigen
+    document.getElementById("loading-overlay").style.display = "flex";
+    
+    // 2. Timeout nutzen, damit der Browser Zeit hat, das Overlay zu rendern (Paint Frame)
+    // bevor der Main-Thread von OpenCV blockiert wird.
+    setTimeout(() => {
+        runCalibration();
+    }, 100);
+}
+
 function runCalibration() {
-    document.getElementById("status").innerText = "Berechne...";
-    
-    cameraMatrix = new cv.Mat();
-    distCoeffs = new cv.Mat();
-    let rvecs = new cv.MatVector();
-    let tvecs = new cv.MatVector();
-    
-    let size = new cv.Size(streamWidth, streamHeight);
-    
-    cv.calibrateCamera(objPointsCalib, imgPointsCalib, size, cameraMatrix, distCoeffs, rvecs, tvecs);
-    
-    isCalibrated = true;
-    
-    // Aufräumen
-    objPointsCalib.delete(); imgPointsCalib.delete();
-    rvecs.delete(); tvecs.delete();
-    
-    document.getElementById("status").innerText = "Mess-Modus";
-    document.getElementById("instruction").innerText = "Tippe auf den Bildschirm,\num Punkte auf der Ebene zu messen.";
+    try {
+        cameraMatrix = new cv.Mat();
+        distCoeffs = new cv.Mat();
+        let rvecs = new cv.MatVector();
+        let tvecs = new cv.MatVector();
+        
+        let size = new cv.Size(streamWidth, streamHeight);
+        
+        // --- DER BLOCKIERENDE TEIL ---
+        cv.calibrateCamera(objPointsCalib, imgPointsCalib, size, cameraMatrix, distCoeffs, rvecs, tvecs);
+        // -----------------------------
+
+        isCalibrated = true;
+        
+        // Aufräumen
+        objPointsCalib.delete(); imgPointsCalib.delete();
+        rvecs.delete(); tvecs.delete();
+
+        // UI Updates
+        document.getElementById("status").innerText = "Mess-Modus Aktiv";
+        document.getElementById("instruction").innerText = "Tippe auf den Bildschirm zum Messen.";
+        document.getElementById("progress-track").style.display = "none";
+        
+    } catch(e) {
+        alert("Kalibrierung fehlgeschlagen. Seite neu laden.");
+        console.error(e);
+    } finally {
+        document.getElementById("loading-overlay").style.display = "none";
+        isCalculating = false;
+        requestAnimationFrame(loop); // Loop wieder starten
+    }
 }
 
 function findMarkerAndPose(src) {
@@ -199,62 +271,44 @@ function findMarkerAndPose(src) {
         let approx = result.approx;
         let corners = sortCorners(approx);
         
-        drawQuad(corners, "#0f0");
+        drawQuad(corners, "#00ff88"); // Grün = Tracking OK
         
-        // Pose Estimation (SolvePnP)
         let imgPts = cv.matFromArray(4, 1, cv.CV_32FC2, corners);
         let objPts = cv.matFromArray(4, 1, cv.CV_32FC3, [
-            0, 0, 0,       // TL
-            A4_W, 0, 0,    // TR
-            A4_W, A4_H, 0, // BR
-            0, A4_H, 0     // BL
+            0, 0, 0, A4_W, 0, 0, A4_W, A4_H, 0, 0, A4_H, 0
         ]);
 
         if (!rvec) rvec = new cv.Mat();
         if (!tvec) tvec = new cv.Mat();
 
-        // solvePnP liefert true bei Erfolg
-        let success = cv.solvePnP(objPts, imgPts, cameraMatrix, distCoeffs, rvec, tvec);
+        cv.solvePnP(objPts, imgPts, cameraMatrix, distCoeffs, rvec, tvec);
         
-        if(success) {
-            // Zeige Distanz zur Kamera an
-            let dist = Math.sqrt(
-                tvec.data64F[0]**2 + tvec.data64F[1]**2 + tvec.data64F[2]**2
-            );
-            document.getElementById("marker-info").innerText = "Distanz: " + dist.toFixed(1) + " cm";
-        }
-
         imgPts.delete(); objPts.delete(); approx.delete();
-    } else {
-        document.getElementById("marker-info").innerText = "Kein Marker gefunden";
     }
 }
 
-// Erkennung eines Vierecks
 function detectQuad(src) {
     let gray = new cv.Mat();
     let blur = new cv.Mat();
     let edges = new cv.Mat();
     let contours = new cv.MatVector();
     let hierarchy = new cv.Mat();
-    
     let bestResult = null;
 
     try {
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-        cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
-        cv.Canny(blur, edges, 50, 150); // Canny Thresholds anpassen je nach Licht
+        // Leichteres Blur ist schneller
+        cv.GaussianBlur(gray, blur, new cv.Size(3, 3), 0);
+        cv.Canny(blur, edges, 50, 150);
         
         cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
         let maxArea = 0;
-
         for (let i = 0; i < contours.size(); i++) {
             let cnt = contours.get(i);
             let area = cv.contourArea(cnt);
             
-            // Filter: Muss groß genug sein
-            if (area > 20000) {
+            if (area > 10000) { // Muss groß genug sein
                 let peri = cv.arcLength(cnt, true);
                 let approx = new cv.Mat();
                 cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
@@ -262,9 +316,8 @@ function detectQuad(src) {
                 if (approx.rows === 4) {
                     if (area > maxArea) {
                         maxArea = area;
-                        // Falls wir schon einen hatten, löschen
                         if (bestResult) bestResult.approx.delete();
-                        bestResult = { approx: approx, area: area };
+                        bestResult = { approx: approx };
                     } else {
                         approx.delete();
                     }
@@ -276,41 +329,25 @@ function detectQuad(src) {
     } finally {
         gray.delete(); blur.delete(); edges.delete(); contours.delete(); hierarchy.delete();
     }
-    
-    return bestResult; // Enthält .approx (muss vom Caller gelöscht werden)
+    return bestResult;
 }
 
-// Sortiert Punkte: TL, TR, BR, BL
 function sortCorners(approx) {
     let d = approx.data32S;
-    // Format: [x1, y1, x2, y2, ...]
     let pts = [
-        {x: d[0], y: d[1]},
-        {x: d[2], y: d[3]},
-        {x: d[4], y: d[5]},
-        {x: d[6], y: d[7]}
+        {x: d[0], y: d[1]}, {x: d[2], y: d[3]},
+        {x: d[4], y: d[5]}, {x: d[6], y: d[7]}
     ];
-    
-    // Sortiere nach Y (Top vs Bottom)
     pts.sort((a,b) => a.y - b.y);
-    
-    // Top-Points (ersten 2) nach X sortieren
     let top = pts.slice(0,2).sort((a,b) => a.x - b.x);
-    // Bottom-Points (letzten 2) nach X sortieren
     let bottom = pts.slice(2,4).sort((a,b) => a.x - b.x);
-    
-    // Rückgabe array für cv.matFromArray (Float32)
-    return [
-        top[0].x, top[0].y,      // TL
-        top[1].x, top[1].y,      // TR
-        bottom[1].x, bottom[1].y,// BR
-        bottom[0].x, bottom[0].y // BL
-    ];
+    return [top[0].x, top[0].y, top[1].x, top[1].y, bottom[1].x, bottom[1].y, bottom[0].x, bottom[0].y];
 }
 
 function drawQuad(coords, color) {
     ctx.strokeStyle = color;
     ctx.lineWidth = 4;
+    ctx.lineJoin = "round";
     ctx.beginPath();
     ctx.moveTo(coords[0], coords[1]);
     ctx.lineTo(coords[2], coords[3]);
@@ -318,33 +355,22 @@ function drawQuad(coords, color) {
     ctx.lineTo(coords[6], coords[7]);
     ctx.closePath();
     ctx.stroke();
-    
-    // Ecke 1 markieren
-    ctx.fillStyle = "red";
-    ctx.fillRect(coords[0]-5, coords[1]-5, 10, 10);
 }
 
-// --- INTERAKTION & MATHEMATIK (Ray Casting) ---
-
+// --- Interaktion ---
 canvas.addEventListener("mousedown", (e) => {
-    if (!isCalibrated || !rvec || !tvec) return;
+    if (!isCalibrated || !rvec) return;
     
-    // 1. Klick-Koordinaten korrekt skalieren
-    // Da wir CSS 'object-fit: cover' benutzen, müssen wir die dargestellte Größe berechnen
     let rect = canvas.getBoundingClientRect();
     
-    // Verhältnis von Video-Aspect zu Screen-Aspect
+    // Scaling berechnen (Contain vs Cover vs interne Auflösung)
     let vidRatio = streamWidth / streamHeight;
     let screenRatio = rect.width / rect.height;
-    
-    let renderW, renderH, offsetX, offsetY;
-    let scale;
+    let scale, renderW, renderH, offsetX, offsetY;
 
     if (screenRatio > vidRatio) {
-        // Screen ist breiter -> Video wird oben/unten beschnitten (Zoom in Breite)
         scale = rect.width / streamWidth;
     } else {
-        // Screen ist höher -> Video wird links/rechts beschnitten (Zoom in Höhe)
         scale = rect.height / streamHeight;
     }
 
@@ -353,98 +379,59 @@ canvas.addEventListener("mousedown", (e) => {
     offsetX = (rect.width - renderW) / 2;
     offsetY = (rect.height - renderH) / 2;
 
-    // Klick relativ zum Video-Ursprung
-    let clickX = e.clientX - rect.left - offsetX;
-    let clickY = e.clientY - rect.top - offsetY;
-    
-    // Zurück in Video-Pixel-Koordinaten
-    let u = clickX / scale;
-    let v = clickY / scale;
+    let clickX = (e.clientX - rect.left - offsetX) / scale;
+    let clickY = (e.clientY - rect.top - offsetY) / scale;
 
-    // Außerhalb des Videos?
-    if (u < 0 || u > streamWidth || v < 0 || v > streamHeight) return;
+    if (clickX < 0 || clickX > streamWidth || clickY < 0 || clickY > streamHeight) return;
 
-    // 2. Berechnung: Ray-Plane Intersection (Z=0)
-    let worldPoint = calculateWorldPointOnPlane(u, v);
+    let pt = calculateWorldPoint(clickX, clickY);
     
-    if (worldPoint) {
-        let msg = `Pos: X=${worldPoint.x.toFixed(1)}cm, Y=${worldPoint.y.toFixed(1)}cm`;
-        document.getElementById("instruction").innerText = msg;
-        
-        // Punkt zeichnen
-        ctx.fillStyle = "#0ff";
-        ctx.beginPath();
-        ctx.arc(u, v, 10, 0, 2*Math.PI);
-        ctx.fill();
+    if (pt) {
+        showToast(`X: ${pt.x.toFixed(1)} cm | Y: ${pt.y.toFixed(1)} cm`);
+        drawPoint(clickX, clickY);
     }
 });
 
-function calculateWorldPointOnPlane(u, v) {
-    // Ziel: Schnittpunkt des Strahls durch Pixel (u,v) mit der Ebene Z=0 (Papier-Ebene)
-    
-    // K umkehren
-    let Kinv = cameraMatrix.inv(); // Kamera-Intrinsics invertieren
-    
-    // Rotationsmatrix aus Rodrigues
-    let R = new cv.Mat();
-    cv.Rodrigues(rvec, R);
-    let Rinv = R.inv(); // R^-1 = R^T
-    
-    try {
-        // 1. Strahl im Kamera-Koordinatensystem
-        // Ray_cam = K_inv * [u, v, 1]
-        let uvPoint = cv.matFromArray(3, 1, cv.CV_64F, [u, v, 1]);
-        let rayCam = new cv.Mat();
-        cv.gemm(Kinv, uvPoint, 1, new cv.Mat(), 0, rayCam);
-        
-        // 2. Strahl im Welt-Koordinatensystem (nur Richtung)
-        // Ray_world_dir = R_inv * Ray_cam
-        let rayWorld = new cv.Mat();
-        cv.gemm(Rinv, rayCam, 1, new cv.Mat(), 0, rayWorld);
-        
-        // 3. Kamera-Position in Welt-Koordinaten
-        // Cam_pos = -R_inv * tvec
-        let camPos = new cv.Mat();
-        let negT = new cv.Mat();
-        cv.multiply(tvec, cv.matFromArray(3, 1, cv.CV_64F, [-1,-1,-1]), negT); // tvec negieren
-        cv.gemm(Rinv, tvec, -1, new cv.Mat(), 0, camPos); // camPos = -1 * Rinv * tvec
-
-        // Daten extrahieren für einfache JS Berechnung
-        let rX = rayWorld.data64F[0];
-        let rY = rayWorld.data64F[1];
-        let rZ = rayWorld.data64F[2];
-        
-        let cX = camPos.data64F[0];
-        let cY = camPos.data64F[1];
-        let cZ = camPos.data64F[2];
-        
-        // 4. Schnittpunkt mit Z=0 finden
-        // Geradengleichung: P = C + s * R
-        // Wir suchen s, sodass P.z = 0
-        // 0 = cZ + s * rZ  =>  s = -cZ / rZ
-        
-        if (Math.abs(rZ) < 0.0001) return null; // Parallel zur Ebene
-        
-        let s = -cZ / rZ;
-        
-        // Schnittpunkt berechnen
-        let pX = cX + s * rX;
-        let pY = cY + s * rY;
-        
-        // Cleanup Matrizen
-        uvPoint.delete(); rayCam.delete(); rayWorld.delete(); 
-        camPos.delete(); negT.delete(); 
-        
-        return { x: pX, y: pY };
-        
-    } catch(err) {
-        console.error("Math error", err);
-        return null;
-    } finally {
-        Kinv.delete(); R.delete(); Rinv.delete();
-    }
+function showToast(text) {
+    let t = document.getElementById("result-toast");
+    t.innerText = text;
+    t.style.opacity = "1";
+    setTimeout(() => { t.style.opacity = "0"; }, 3000);
 }
 
+function drawPoint(x, y) {
+    ctx.fillStyle = "#00ff88";
+    ctx.beginPath();
+    ctx.arc(x, y, 10, 0, 2*Math.PI);
+    ctx.fill();
+}
+
+function calculateWorldPoint(u, v) {
+    // Ray-Plane Intersection Z=0
+    let Kinv = cameraMatrix.inv();
+    let R = new cv.Mat(); cv.Rodrigues(rvec, R);
+    let Rinv = R.inv();
+    
+    let uvPoint = cv.matFromArray(3, 1, cv.CV_64F, [u, v, 1]);
+    let rayCam = new cv.Mat(); cv.gemm(Kinv, uvPoint, 1, new cv.Mat(), 0, rayCam);
+    let rayWorld = new cv.Mat(); cv.gemm(Rinv, rayCam, 1, new cv.Mat(), 0, rayWorld);
+    
+    let camPos = new cv.Mat();
+    cv.gemm(Rinv, tvec, -1, new cv.Mat(), 0, camPos);
+
+    let rZ = rayWorld.data64F[2];
+    let cZ = camPos.data64F[2];
+    
+    if (Math.abs(rZ) < 0.0001) return null;
+    
+    let s = -cZ / rZ;
+    let pX = camPos.data64F[0] + s * rayWorld.data64F[0];
+    let pY = camPos.data64F[1] + s * rayWorld.data64F[1];
+    
+    uvPoint.delete(); rayCam.delete(); rayWorld.delete(); camPos.delete(); Kinv.delete(); R.delete(); Rinv.delete();
+    
+    return { x: pX, y: pY };
+}
 </script>
 </body>
 </html>
